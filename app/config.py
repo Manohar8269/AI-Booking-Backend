@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     )
     jwt_expire_minutes: int = 60
     frontend_origins: str = Field(
-        default="http://localhost:5173",
+        default="http://localhost:5173,https://ai-booking-frontend-k40y.onrender.com",
         validation_alias=AliasChoices("FRONTEND_ORIGIN", "FRONTEND_ORIGINS"),
     )
     approval_ttl_minutes: int = Field(default=15, ge=1, le=1440)
