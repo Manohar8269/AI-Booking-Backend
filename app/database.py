@@ -52,7 +52,7 @@ def initialize_database() -> None:
         collection = database[collection_name]
         highest = collection.find_one({}, {"_id": 1}, sort=[("_id", DESCENDING)])
         highest_id = highest["_id"] if highest and isinstance(highest["_id"], int) else 0
-        database._counters.find_one_and_update(
+        database["_counters"].find_one_and_update(
             {"_id": collection_name},
             {"$max": {"value": highest_id}},
             upsert=True,
