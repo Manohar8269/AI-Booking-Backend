@@ -4,15 +4,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.database import Base, engine, migrate_sqlite_schema
+from app.database import initialize_database
 from app.routers import approvals, audit, auth, availability, chat, meetings
-from app import models  # noqa: F401 - register SQLAlchemy models before create_all
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    migrate_sqlite_schema()
+    initialize_database()
     yield
 
 

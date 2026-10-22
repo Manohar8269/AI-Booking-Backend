@@ -7,9 +7,6 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
-from sqlalchemy.orm import Session
-
 from app.config import get_settings
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -161,11 +158,12 @@ def _duration_minutes(message: str) -> int | None:
     return duration if 1 <= duration <= 24 * 60 else None
 
 
-def _meeting_candidates(db: Session, user_id: int) -> list[Meeting]:
-    return list(db.scalars(select(Meeting).where(
-        Meeting.owner_id == user_id,
-        Meeting.status == "scheduled",
-    ).order_by(Meeting.start_time)))
+def _meeting_candidates(db, user_id: int) -> list[Meeting]:
+    return db.find_many(
+        Meeting,
+        {"owner_id": user_id, "status": "scheduled"},
+        sort=[("start_time", 1)],
+    )
 
 
 def _describe_meetings(meetings: list[Meeting], empty: str = "You have no upcoming meetings.") -> str:
@@ -177,9 +175,9 @@ def _describe_meetings(meetings: list[Meeting], empty: str = "You have no upcomi
     )
 
 
-def _save_pending(db: Session, user_id: int, action: str, payload: dict) -> None:
+def _save_pending(db, user_id: int, action: str, payload: dict) -> None:
     pending_expiry = _now() + timedelta(minutes=get_settings().approval_ttl_minutes)
-    pending = db.scalar(select(ChatPendingAction).where(ChatPendingAction.owner_id == user_id))
+    pending = db.find_one(ChatPendingAction, {"owner_id": user_id})
     if pending is None:
         pending = ChatPendingAction(owner_id=user_id, action=action, payload=payload, expires_at=pending_expiry)
         db.add(pending)
@@ -189,11 +187,11 @@ def _save_pending(db: Session, user_id: int, action: str, payload: dict) -> None
         pending.expires_at = pending_expiry
 
 
-def _clear_pending(db: Session, pending: ChatPendingAction) -> None:
+def _clear_pending(db, pending: ChatPendingAction) -> None:
     db.delete(pending)
 
 
-def _create_preview(db: Session, user: User, payload: dict) -> str:
+def _create_preview(db, user: User, payload: dict) -> str:
     required = {"title", "start_time", "end_time"}
     if not required.issubset(payload):
         missing = []
@@ -293,14 +291,14 @@ def _edit_command(message: str) -> tuple[str, str] | None:
     return None
 
 
-def _target_meeting(db: Session, user: User, query: str) -> tuple[Meeting | None, str | None]:
+def _target_meeting(db, user: User, query: str) -> tuple[Meeting | None, str | None]:
     by_id = ID_PATTERN.search(query)
     if by_id:
-        meeting = db.scalar(select(Meeting).where(
-            Meeting.id == int(by_id.group(1)),
-            Meeting.owner_id == user.id,
-            Meeting.status == "scheduled",
-        ))
+        meeting = db.find_one(Meeting, {
+            "_id": int(by_id.group(1)),
+            "owner_id": user.id,
+            "status": "scheduled",
+        })
         return meeting, None if meeting else "I could not find that scheduled meeting."
     meetings = _meeting_candidates(db, user.id)
     normalized = re.sub(r"^(?:my|the)\s+|\s+meeting$", "", query.lower().strip(" \"'.")).strip()
@@ -312,7 +310,7 @@ def _target_meeting(db: Session, user: User, query: str) -> tuple[Meeting | None
     return matches[0], None
 
 
-def _request_cancel(db: Session, user: User, query: str) -> str:
+def _request_cancel(db, user: User, query: str) -> str:
     meeting, issue = _target_meeting(db, user, query)
     if issue:
         return issue
@@ -442,7 +440,7 @@ def _intent_from_datetime_fields(intent: dict) -> tuple[datetime | None, datetim
         return None, None
 
 
-def _confirm_pending(db: Session, user: User, pending: ChatPendingAction, affirmative: bool) -> str:
+def _confirm_pending(db, user: User, pending: ChatPendingAction, affirmative: bool) -> str:
     expires = pending.expires_at
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
@@ -487,6 +485,7 @@ def _confirm_pending(db: Session, user: User, pending: ChatPendingAction, affirm
         assert_no_conflict(db, user.id, start, end, exclude_id=meeting.id)
         for key, value in changes.items():
             setattr(meeting, key, datetime.fromisoformat(value) if key in {"start_time", "end_time"} else value)
+        meeting.updated_at = _now()
         audit(db, user.id, "meeting.updated_via_chat", "meeting", meeting.id, {"fields": sorted(changes)})
         _clear_pending(db, pending)
         db.commit()
@@ -496,7 +495,7 @@ def _confirm_pending(db: Session, user: User, pending: ChatPendingAction, affirm
     return "There is no pending change to confirm."
 
 
-def _apply_edit(db: Session, user: User, message: str, query: str, replacement: str) -> str:
+def _apply_edit(db, user: User, message: str, query: str, replacement: str) -> str:
     meeting, issue = _target_meeting(db, user, query)
     if issue:
         return issue
@@ -531,7 +530,7 @@ def _apply_edit(db: Session, user: User, message: str, query: str, replacement: 
     return f"I can {description}. Reply yes to confirm, or no to discard."
 
 
-def _handle_intent(db: Session, user: User, intent: dict, message: str) -> str:
+def _handle_intent(db, user: User, intent: dict, message: str) -> str:
     name = intent.get("intent")
     if name == "list_upcoming":
         now = _now()
@@ -554,12 +553,16 @@ def _handle_intent(db: Session, user: User, intent: dict, message: str) -> str:
         if not 1 <= duration <= 24 * 60:
             duration = 60
         end = end or start + timedelta(minutes=duration)
-        conflicts = list(db.scalars(select(Meeting).where(
-            Meeting.owner_id == user.id,
-            Meeting.status == "scheduled",
-            Meeting.start_time < end,
-            Meeting.end_time > start,
-        ).order_by(Meeting.start_time)))
+        conflicts = db.find_many(
+            Meeting,
+            {
+                "owner_id": user.id,
+                "status": "scheduled",
+                "start_time": {"$lt": end},
+                "end_time": {"$gt": start},
+            },
+            sort=[("start_time", 1)],
+        )
         if conflicts:
             return "You are not available then. Conflicting meeting(s):\n" + _describe_meetings(conflicts)
         return f"You are available from {_display_local_datetime(start)} to {_display_local_datetime(end)}."
@@ -628,10 +631,10 @@ def _classify_local(message: str) -> dict:
 
 
 @router.post("", response_model=ChatResponse)
-def chat(payload: ChatRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def chat(payload: ChatRequest, db=Depends(get_db), user: User = Depends(get_current_user)):
     message = payload.message.strip()
     settings = get_settings()
-    pending = db.scalar(select(ChatPendingAction).where(ChatPendingAction.owner_id == user.id))
+    pending = db.find_one(ChatPendingAction, {"owner_id": user.id})
     lower = message.lower()
 
     demo = _demo_response(message)

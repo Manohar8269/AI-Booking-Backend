@@ -1,8 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -16,7 +14,7 @@ router = APIRouter(prefix="/api/availability", tags=["availability"])
 def availability(
     start: datetime = Query(...),
     end: datetime = Query(...),
-    db: Session = Depends(get_db),
+    db=Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     try:
@@ -26,10 +24,14 @@ def availability(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if start >= end:
         raise HTTPException(status_code=422, detail="end must be after start")
-    meetings = db.scalars(select(Meeting).where(
-        Meeting.owner_id == user.id,
-        Meeting.status == "scheduled",
-        Meeting.start_time < end,
-        Meeting.end_time > start,
-    ).order_by(Meeting.start_time)).all()
+    meetings = db.find_many(
+        Meeting,
+        {
+            "owner_id": user.id,
+            "status": "scheduled",
+            "start_time": {"$lt": end},
+            "end_time": {"$gt": start},
+        },
+        sort=[("start_time", 1)],
+    )
     return {"start": start, "end": end, "available": not meetings, "meetings": meetings}

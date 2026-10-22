@@ -2,8 +2,6 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import Approval, AuditLog, Meeting
@@ -13,7 +11,7 @@ def _approval_expiry() -> datetime:
     return datetime.now(timezone.utc) + timedelta(minutes=get_settings().approval_ttl_minutes)
 
 
-def audit(db: Session, actor_id: int, action: str, resource_type: str, resource_id: int | str, details: dict | None = None) -> None:
+def audit(db, actor_id: int, action: str, resource_type: str, resource_id: int | str, details: dict | None = None) -> None:
     db.add(AuditLog(
         actor_id=actor_id,
         action=action,
@@ -23,35 +21,35 @@ def audit(db: Session, actor_id: int, action: str, resource_type: str, resource_
     ))
 
 
-def owned_meeting(db: Session, user_id: int, meeting_id: int) -> Meeting:
-    meeting = db.scalar(select(Meeting).where(Meeting.id == meeting_id, Meeting.owner_id == user_id))
+def owned_meeting(db, user_id: int, meeting_id: int) -> Meeting:
+    meeting = db.find_one(Meeting, {"_id": meeting_id, "owner_id": user_id})
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
     return meeting
 
 
 def assert_no_conflict(
-    db: Session, owner_id: int, start_time: datetime, end_time: datetime, exclude_id: int | None = None
+    db, owner_id: int, start_time: datetime, end_time: datetime, exclude_id: int | None = None
 ) -> None:
-    query = select(Meeting.id).where(
-        Meeting.owner_id == owner_id,
-        Meeting.status == "scheduled",
-        Meeting.start_time < end_time,
-        Meeting.end_time > start_time,
-    )
+    query = {
+        "owner_id": owner_id,
+        "status": "scheduled",
+        "start_time": {"$lt": end_time},
+        "end_time": {"$gt": start_time},
+    }
     if exclude_id is not None:
-        query = query.where(Meeting.id != exclude_id)
-    if db.scalar(query.limit(1)) is not None:
+        query["_id"] = {"$ne": exclude_id}
+    if db.find_one(Meeting, query) is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Meeting conflicts with an existing meeting")
 
 
-def request_cancellation(db: Session, user_id: int, meeting: Meeting) -> Approval:
+def request_cancellation(db, user_id: int, meeting: Meeting) -> Approval:
     now = datetime.now(timezone.utc)
-    existing = db.scalar(select(Approval).where(
-        Approval.owner_id == user_id,
-        Approval.meeting_id == meeting.id,
-        Approval.status == "pending",
-    ).order_by(Approval.created_at.desc()))
+    existing = db.find_one(
+        Approval,
+        {"owner_id": user_id, "meeting_id": meeting.id, "status": "pending"},
+        sort=[("created_at", -1)],
+    )
     if existing is not None:
         expiry = existing.expires_at
         if expiry.tzinfo is None:
@@ -74,7 +72,14 @@ def request_cancellation(db: Session, user_id: int, meeting: Meeting) -> Approva
     return approval
 
 
-def decide_approval(db: Session, approval: Approval, decision: str) -> Approval:
+def attach_meeting(approval: Approval, meeting: Meeting | None) -> Approval:
+    approval.meeting_title = meeting.title if meeting else None
+    approval.meeting_status = meeting.status if meeting else None
+    approval.meeting_start_time = meeting.start_time if meeting else None
+    return approval
+
+
+def decide_approval(db, approval: Approval, decision: str) -> Approval:
     now = datetime.now(timezone.utc)
     expires_at = approval.expires_at
     if expires_at.tzinfo is None:
@@ -85,7 +90,7 @@ def decide_approval(db: Session, approval: Approval, decision: str) -> Approval:
         approval.status = "expired"
         approval.decided_at = now
         audit(db, approval.owner_id, "approval.expired", "approval", approval.id)
-        return approval
+        return attach_meeting(approval, db.get(Meeting, approval.meeting_id))
     meeting = db.get(Meeting, approval.meeting_id)
     if meeting is None or meeting.owner_id != approval.owner_id:
         raise HTTPException(status_code=404, detail="Meeting not found")
@@ -93,6 +98,7 @@ def decide_approval(db: Session, approval: Approval, decision: str) -> Approval:
     approval.decided_at = now
     if decision == "approve":
         meeting.status = "cancelled"
+        meeting.updated_at = now
         audit(db, approval.owner_id, "meeting.cancelled", "meeting", meeting.id, {"approval_id": approval.id})
     audit(db, approval.owner_id, f"approval.{approval.status}", "approval", approval.id)
-    return approval
+    return attach_meeting(approval, meeting)

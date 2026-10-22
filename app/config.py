@@ -9,7 +9,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_env: str = "development"
     lab_mode: Literal["secure", "vulnerable"] = "secure"
-    database_url: str = "sqlite:///./lab.db"
+    mongodb_url: str = ""
+    mongodb_database: str = "ai_booking_calendar"
     jwt_secret: str = Field(
         default="development-only-change-this-secret",
         validation_alias=AliasChoices("SECRET_KEY", "JWT_SECRET"),
