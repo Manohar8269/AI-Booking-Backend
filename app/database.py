@@ -117,6 +117,8 @@ class MongoStore:
 
     def find_one(self, model: type[Model], query: dict[str, Any], sort: list[tuple[str, int]] | None = None) -> Model | None:
         document = self._collection(model).find_one(query, sort=sort)
+        if document and (model, int(document["_id"])) in self._deleted:
+            return None
         return self._from_document(model, document) if document else None
 
     def find_many(
@@ -131,8 +133,12 @@ class MongoStore:
             cursor = cursor.sort(sort)
         if limit is not None:
             cursor = cursor.limit(limit)
-        records = [self._from_document(model, document) for document in cursor]
-        return [record for record in records if (model, record.id) not in self._deleted]
+        records = []
+        for document in cursor:
+            if (model, int(document["_id"])) in self._deleted:
+                continue
+            records.append(self._from_document(model, document))
+        return records
 
     def add(self, record: Any) -> None:
         model = type(record)

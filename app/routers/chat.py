@@ -664,8 +664,8 @@ def chat(payload: ChatRequest, db=Depends(get_db), user: User = Depends(get_curr
             if data.get("start_time"):
                 data["end_time"] = (datetime.fromisoformat(data["start_time"]) + timedelta(minutes=duration)).isoformat()
         if data.get("title") and data.get("end_time"):
-            _clear_pending(db, pending)
-            db.flush()
+            # Convert the existing draft into a confirmable create action.
+            # _create_preview/_save_pending updates this pending document in place.
             return ChatResponse(reply=_create_preview(db, user, data), mode=f"{settings.lab_mode}/local")
         _save_pending(db, user.id, "draft_create", data)
         db.commit()
