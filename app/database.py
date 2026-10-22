@@ -77,7 +77,7 @@ class MongoStore:
 
     def _next_id(self, model: type) -> int:
         collection_name = COLLECTIONS[model]
-        counter = self.database._counters.find_one_and_update(
+        counter = self.database["_counters"].find_one_and_update(
             {"_id": collection_name},
             {"$inc": {"value": 1}},
             upsert=True,
