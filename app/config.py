@@ -39,7 +39,27 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins(self) -> list[str]:
-        return [origin.strip() for origin in self.frontend_origins.split(",") if origin.strip()]
+        origins = []
+        for value in self.frontend_origins.split(","):
+            value = value.strip()
+            if not value:
+                continue
+            try:
+                parsed = urlsplit(value)
+            except ValueError:
+                continue
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path not in {"", "/"}:
+                continue
+            origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+            if origin not in origins:
+                origins.append(origin)
+
+        # Keep the deployed frontend allowed even if Render has an older
+        # FRONTEND_ORIGIN value configured alongside FRONTEND_ORIGINS.
+        deployed_frontend = "https://ai-booking-frontend-k40y.onrender.com"
+        if deployed_frontend not in origins:
+            origins.append(deployed_frontend)
+        return origins
 
     @property
     def llm_configured(self) -> bool:
