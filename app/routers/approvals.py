@@ -4,7 +4,7 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import Approval, Meeting, User
 from app.schemas import ApprovalDecision, ApprovalResponse
-from app.services import attach_meeting, decide_approval
+from app.services import attach_meeting, audit, decide_approval
 
 router = APIRouter(prefix="/api/approvals", tags=["approvals"])
 
@@ -27,6 +27,15 @@ def decision(
 ):
     approval = db.find_one(Approval, {"_id": approval_id, "owner_id": user.id})
     if approval is None:
+        audit(
+            db,
+            user.id,
+            "authorization.denied",
+            "approval",
+            approval_id,
+            {"operation": "decision"},
+        )
+        db.commit()
         raise HTTPException(status_code=404, detail="Approval not found")
     result = decide_approval(db, approval, payload.decision)
     db.commit()

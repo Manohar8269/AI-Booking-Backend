@@ -24,6 +24,15 @@ def audit(db, actor_id: int, action: str, resource_type: str, resource_id: int |
 def owned_meeting(db, user_id: int, meeting_id: int) -> Meeting:
     meeting = db.find_one(Meeting, {"_id": meeting_id, "owner_id": user_id})
     if meeting is None:
+        audit(
+            db,
+            user_id,
+            "authorization.denied",
+            "meeting",
+            meeting_id,
+            {"operation": "access"},
+        )
+        db.commit()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
     return meeting
 
