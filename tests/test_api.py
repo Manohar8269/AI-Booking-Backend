@@ -14,6 +14,15 @@ def meeting_payload(title="Planning"):
     }
 
 
+def create_meeting_at_offset(client, headers, title, days):
+    start = datetime.now(timezone.utc) + timedelta(days=days)
+    return client.post("/api/meetings", json={
+        "title": title,
+        "start_time": start.isoformat(),
+        "end_time": (start + timedelta(minutes=40)).isoformat(),
+    }, headers=headers)
+
+
 def test_signup_login_and_current_user(client):
     signup = client.post("/api/auth/signup", json={
         "name": "Test User",
@@ -49,7 +58,7 @@ def test_meetings_are_owner_scoped(client, user_headers):
     other = {"Authorization": f"Bearer {token}"}
     assert client.get(f"/api/meetings/{meeting_id}", headers=other).status_code == 404
     cross_user_chat = client.post("/api/chat", json={"message": f"cancel meeting {meeting_id}"}, headers=other)
-    assert "couldn't find that scheduled meeting" in cross_user_chat.json()["reply"]
+    assert f"couldn't find a meeting with ID {meeting_id}" in cross_user_chat.json()["reply"]
     assert created.json()["title"] not in cross_user_chat.json()["reply"]
     assert client.patch(f"/api/meetings/{meeting_id}", json={"title": "Stolen"}, headers=other).status_code == 404
     assert client.delete(f"/api/meetings/{meeting_id}", headers=other).status_code == 404
@@ -516,7 +525,7 @@ def test_invalid_meeting_id_never_falls_back_to_a_title_match(client, user_heade
     result = client.post("/api/chat", json={
         "message": "Cancel meeting 999 (Project meeting)",
     }, headers=user_headers)
-    assert "couldn't find that scheduled meeting" in result.json()["reply"]
+    assert "couldn't find a meeting with ID 999" in result.json()["reply"]
     assert client.get("/api/approvals", headers=user_headers).json() == []
     assert client.get(f"/api/meetings/{created.json()['id']}", headers=user_headers).json()["status"] == "scheduled"
 
@@ -564,7 +573,100 @@ def test_chat_resolves_generic_meeting_by_date_and_returns_useful_no_match(clien
         "message": "Cancel my nonexistent workshop",
     }, headers=user_headers)
     assert "couldn't find a scheduled meeting" in missing.json()["reply"]
-    assert "Tomorrow review" in missing.json()["reply"]
+    assert "Tomorrow review" not in missing.json()["reply"]
+    assert "show your upcoming meetings" in missing.json()["reply"]
+
+
+def test_chat_shows_specific_meeting_by_id_and_supports_read_phrasings(client, user_headers):
+    for index in range(5):
+        created = create_meeting_at_offset(client, user_headers, f"Unrelated {index}", index + 2)
+        assert created.status_code == 201
+    target = create_meeting_at_offset(client, user_headers, "Project Meeting", 10)
+    assert target.status_code == 201
+    assert target.json()["id"] == 6
+    meeting_id = target.json()["id"]
+    original = client.get(f"/api/meetings/{meeting_id}", headers=user_headers).json()
+
+    for phrase in (
+        "show me meeting 6",
+        "show meeting 6",
+        "show meeting ID 6",
+        "get meeting 6",
+        "view meeting #6",
+        "find meeting 6",
+        "what are the details of meeting 6?",
+        "tell me about meeting #6",
+    ):
+        classified = chat_router._classify_local(phrase)
+        assert classified["intent"] == "get_meeting"
+        assert classified["meeting_id"] == meeting_id
+        response = client.post("/api/chat", json={"message": phrase}, headers=user_headers)
+        reply = response.json()["reply"]
+        assert response.status_code == 200
+        assert "Found meeting #6: Project Meeting." in reply
+        assert f"Start: {chat_router._display_local_datetime(datetime.fromisoformat(original['start_time']))}." in reply
+        assert f"End: {chat_router._display_local_datetime(datetime.fromisoformat(original['end_time']))}." in reply
+        assert "couldn't find" not in reply.lower()
+        assert "You can specify the meeting ID" not in reply
+
+    after = client.get(f"/api/meetings/{meeting_id}", headers=user_headers).json()
+    assert after == original
+
+
+def test_chat_missing_meeting_id_does_not_append_unrelated_upcoming_meetings(client, user_headers):
+    unrelated = create_meeting_at_offset(client, user_headers, "Private unrelated title", 4)
+    assert unrelated.status_code == 201
+    missing_id = unrelated.json()["id"] + 100
+    response = client.post(
+        "/api/chat",
+        json={"message": f"show me meeting {missing_id}"},
+        headers=user_headers,
+    )
+    reply = response.json()["reply"]
+    assert f"couldn't find a meeting with id {missing_id}" in reply.lower()
+    assert "Private unrelated title" not in reply
+    assert "You can specify the meeting ID" not in reply
+
+
+def test_chat_meeting_id_lookup_is_user_scoped(client, user_headers):
+    target = create_meeting_at_offset(client, user_headers, "Alice confidential review", 5)
+    meeting_id = target.json()["id"]
+    signup = client.post("/api/auth/signup", json={
+        "name": "Bob",
+        "email": "bob@example.test",
+        "password": "bob-password-123",
+    })
+    assert signup.status_code == 201
+    token = client.post("/api/auth/login", json={
+        "email": "bob@example.test",
+        "password": "bob-password-123",
+    }).json()["access_token"]
+    bob_headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.post(
+        "/api/chat",
+        json={"message": f"show me meeting {meeting_id}"},
+        headers=bob_headers,
+    )
+    reply = response.json()["reply"].lower()
+    assert f"couldn't find a meeting with id {meeting_id}" in reply
+    assert "alice confidential review" not in reply
+    assert "Found meeting #" not in reply
+    assert "Start:" not in reply
+
+
+def test_chat_upcoming_request_still_lists_authorized_meetings(client, user_headers):
+    created = create_meeting_at_offset(client, user_headers, "Upcoming planning", 3)
+    assert created.status_code == 201
+    response = client.post(
+        "/api/chat",
+        json={"message": "show my upcoming meetings"},
+        headers=user_headers,
+    )
+    reply = response.json()["reply"]
+    assert "Upcoming planning" in reply
+    assert "Found meeting #" not in reply
+    assert "couldn't find" not in reply.lower()
 
 
 def test_rejected_reschedule_does_not_change_meeting(client, user_headers):

@@ -32,6 +32,11 @@ TIME_RANGE_PATTERN = re.compile(
 )
 DURATION_PATTERN = re.compile(r"\b(?:for\s+)?(\d{1,3})\s*(hours?|hrs?|minutes?|mins?)\b", re.IGNORECASE)
 ID_PATTERN = re.compile(r"\bmeeting\s*(?:id\s*)?#?\s*(\d+)\b|(?<!\w)#(\d+)\b", re.IGNORECASE)
+MEETING_READ_PATTERN = re.compile(
+    r"\b(?:show|find|get|view|inspect|tell\s+me\s+about)\b|"
+    r"\bwhat\s+are\s+the\s+details\s+of\b|\bdetails?\s+of\b",
+    re.IGNORECASE,
+)
 SPELLING_HINTS = (
     "schedule", "book", "create", "meeting", "meetings", "appointment", "calendar", "available",
     "availability", "conflict", "cancel", "delete", "remove", "reschedule", "rename", "upcoming",
@@ -393,25 +398,44 @@ def _meeting_query_text(query: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", text))
 
 
+def _meeting_id_from_text(text: str) -> int | None:
+    match = ID_PATTERN.search(text)
+    if not match:
+        return None
+    return int(match.group(1) or match.group(2))
+
+
+def _meeting_details_reply(meeting: Meeting) -> str:
+    details = [
+        f"Found meeting #{meeting.id}: {meeting.title}.",
+        f"Start: {_display_local_datetime(meeting.start_time)}.",
+        f"End: {_display_local_datetime(meeting.end_time)}.",
+    ]
+    if meeting.location:
+        details.append(f"Location: {meeting.location}.")
+    details.append("What would you like to do with this meeting?")
+    return " ".join(details)
+
+
 def _target_meeting(
     db,
     user: User,
     query: str,
     date_constraint: date | None = None,
 ) -> tuple[Meeting | None, str | None]:
-    by_id = ID_PATTERN.search(query)
-    if by_id:
-        meeting_id = int(by_id.group(1) or by_id.group(2))
-        meeting = db.find_one(Meeting, {
-            "_id": meeting_id,
-            "owner_id": user.id,
-            "status": "scheduled",
-        })
+    meeting_id = _meeting_id_from_text(query)
+    if meeting_id is not None:
+        try:
+            meeting = owned_meeting(db, user.id, meeting_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            return None, f"I couldn't find a meeting with ID {meeting_id} in your calendar. You can ask me to show your upcoming meetings."
+        if meeting.status != "scheduled":
+            return None, f"Meeting ID {meeting_id} is not currently scheduled."
         if meeting and date_constraint and _as_local(meeting.start_time).date() != date_constraint:
-            meeting = None
-        if meeting:
-            return meeting, None
-        return None, "I couldn't find that scheduled meeting in your calendar."
+            return None, f"I couldn't find a meeting with ID {meeting_id} on that date in your calendar."
+        return meeting, None
     if date_constraint is None:
         date_constraint = _date_from_text(query, _now())
     meetings = _meeting_candidates(db, user.id)
@@ -444,12 +468,7 @@ def _target_meeting(
             if len(matches) == 1:
                 return matches[0], None
             return None, "I found more than one matching meeting. Please choose one:\n" + _describe_meetings(matches)
-    upcoming = [m for m in meetings if _as_local(m.start_time) >= _now()][:5]
-    fallback = _describe_meetings(upcoming, "there are no upcoming scheduled meetings")
-    return None, (
-        "I couldn't find a scheduled meeting matching that request in your calendar. "
-        f"Your upcoming meetings are: {fallback}. You can specify the meeting ID."
-    )
+    return None, "I couldn't find a scheduled meeting matching that request in your calendar. You can ask me to show your upcoming meetings."
 
 
 def _request_cancel(db, user: User, query: str) -> str:
@@ -813,19 +832,31 @@ def _handle_intent(
             return "Which meeting should I cancel? Please include its title or meeting ID."
         return _request_cancel(db, user, query)
     if name == "get_meeting":
+        requested_id = intent.get("meeting_id")
+        if not isinstance(requested_id, int) or isinstance(requested_id, bool) or requested_id <= 0:
+            requested_id = _meeting_id_from_text(message)
+        if requested_id is not None:
+            try:
+                meeting = owned_meeting(db, user.id, requested_id)
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                return f"I couldn't find a meeting with ID {requested_id} in your calendar. You can ask me to show your upcoming meetings."
+            return _meeting_details_reply(meeting)
         query = intent.get("meeting_query") if isinstance(intent.get("meeting_query"), str) else ""
         if not query:
-            match = re.search(r"\b(?:show|find|inspect|details? of)\s+(.+)$", message, re.IGNORECASE)
-            query = match.group(1).strip() if match else ""
+            match = re.search(
+                r"\b(?:show|find|get|view|inspect)\s+(?:me\s+)?(.+)$|"
+                r"\b(?:tell\s+me\s+about|what\s+are\s+the\s+details\s+of|details?\s+of)\s+(.+)$",
+                message,
+                re.IGNORECASE,
+            )
+            query = next((group.strip() for group in match.groups() if group), "") if match else ""
         meeting, issue = _target_meeting(db, user, query)
         if issue:
             return issue
         assert meeting is not None
-        return (
-            f"Found meeting #{meeting.id}: {meeting.title} — "
-            f"{_display_local_datetime(meeting.start_time)}–{_display_local_datetime(meeting.end_time)}. "
-            "What would you like to change?"
-        )
+        return _meeting_details_reply(meeting)
     if name == "edit_meeting":
         meeting_query = intent.get("meeting_query") if isinstance(intent.get("meeting_query"), str) else ""
         replacement = intent.get("new_title") if isinstance(intent.get("new_title"), str) else ""
@@ -852,8 +883,15 @@ def _classify_local(message: str) -> dict:
         return {"intent": "cancel_meeting"}
     if _edit_command(message) is not None or any(word in lower for word in ("move ", "reschedule", "change title", "rename", "edit ")):
         return {"intent": "edit_meeting"}
+    meeting_id = _meeting_id_from_text(message)
     if (
-        re.search(r"\b(?:show|find|inspect|details? of)\b.*\b(?:meeting|#\d+)\b", lower)
+        meeting_id is not None
+        and MEETING_READ_PATTERN.search(lower)
+        and not re.search(r"\b(?:upcoming|all meetings)\b", lower)
+    ):
+        return {"intent": "get_meeting", "meeting_id": meeting_id}
+    if (
+        re.search(r"\b(?:show|find|get|view|inspect|tell me about|details? of)\b.*\b(?:meeting|#\d+)\b", lower)
         and not re.search(r"\b(?:upcoming|all meetings)\b", lower)
         and not re.search(r"\bmeetings\b", lower)
     ):
