@@ -29,6 +29,7 @@ def health():
         "chat_mode": "openai-compatible" if configured else "local",
         "external_llm": "configured" if configured else "disabled",
         "llm_configured": configured,
+        "default_timezone": settings.default_timezone,
     }
 
 

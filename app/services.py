@@ -47,7 +47,7 @@ def request_cancellation(db, user_id: int, meeting: Meeting) -> Approval:
     now = datetime.now(timezone.utc)
     existing = db.find_one(
         Approval,
-        {"owner_id": user_id, "meeting_id": meeting.id, "status": "pending"},
+        {"owner_id": user_id, "meeting_id": meeting.id, "action": "cancel_meeting", "status": "pending"},
         sort=[("created_at", -1)],
     )
     if existing is not None:
@@ -72,6 +72,41 @@ def request_cancellation(db, user_id: int, meeting: Meeting) -> Approval:
     return approval
 
 
+def request_update_approval(db, user_id: int, meeting: Meeting, changes: dict) -> Approval:
+    now = datetime.now(timezone.utc)
+    existing = db.find_one(
+        Approval,
+        {"owner_id": user_id, "meeting_id": meeting.id, "action": "update_meeting", "status": "pending"},
+        sort=[("created_at", -1)],
+    )
+    if existing is not None:
+        expiry = existing.expires_at
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry > now and existing.payload == changes:
+            return existing
+        if expiry > now:
+            existing.status = "rejected"
+            existing.decided_at = now
+            audit(db, user_id, "approval.superseded", "approval", existing.id)
+        if expiry <= now:
+            existing.status = "expired"
+            existing.decided_at = now
+            audit(db, user_id, "approval.expired", "approval", existing.id)
+    approval = Approval(
+        owner_id=user_id,
+        meeting_id=meeting.id,
+        action="update_meeting",
+        payload=changes,
+        status="pending",
+        expires_at=_approval_expiry(),
+    )
+    db.add(approval)
+    db.flush()
+    audit(db, user_id, "meeting.update_requested", "meeting", meeting.id, {"approval_id": approval.id})
+    return approval
+
+
 def attach_meeting(approval: Approval, meeting: Meeting | None) -> Approval:
     approval.meeting_title = meeting.title if meeting else None
     approval.meeting_status = meeting.status if meeting else None
@@ -90,15 +125,53 @@ def decide_approval(db, approval: Approval, decision: str) -> Approval:
         approval.status = "expired"
         approval.decided_at = now
         audit(db, approval.owner_id, "approval.expired", "approval", approval.id)
-        return attach_meeting(approval, db.get(Meeting, approval.meeting_id))
-    meeting = db.get(Meeting, approval.meeting_id)
-    if meeting is None or meeting.owner_id != approval.owner_id:
+        meeting = db.find_one(Meeting, {"_id": approval.meeting_id, "owner_id": approval.owner_id})
+        return attach_meeting(approval, meeting)
+    meeting = db.find_one(
+        Meeting,
+        {"_id": approval.meeting_id, "owner_id": approval.owner_id, "status": "scheduled"},
+    )
+    if meeting is None:
         raise HTTPException(status_code=404, detail="Meeting not found")
+    if decision == "approve":
+        if approval.action == "cancel_meeting":
+            meeting.status = "cancelled"
+            meeting.updated_at = now
+            audit(db, approval.owner_id, "meeting.cancelled", "meeting", meeting.id, {"approval_id": approval.id})
+        elif approval.action == "update_meeting":
+            changes = approval.payload
+            allowed_fields = {"title", "description", "location", "attendees", "start_time", "end_time"}
+            if not changes or not set(changes).issubset(allowed_fields):
+                raise HTTPException(status_code=422, detail="Approval contains an invalid meeting update")
+            normalized = {}
+            for key, value in changes.items():
+                if key in {"start_time", "end_time"}:
+                    try:
+                        value = datetime.fromisoformat(value)
+                    except (TypeError, ValueError) as exc:
+                        raise HTTPException(status_code=422, detail="Approval contains an invalid meeting time") from exc
+                    if value.tzinfo is None or value.utcoffset() is None:
+                        raise HTTPException(status_code=422, detail="Approval meeting times must include a timezone")
+                normalized[key] = value
+            start = normalized.get("start_time", meeting.start_time)
+            end = normalized.get("end_time", meeting.end_time)
+            if start >= end:
+                raise HTTPException(status_code=422, detail="end_time must be after start_time")
+            assert_no_conflict(db, approval.owner_id, start, end, exclude_id=meeting.id)
+            for key, value in normalized.items():
+                setattr(meeting, key, value)
+            meeting.updated_at = now
+            audit(
+                db,
+                approval.owner_id,
+                "meeting.updated",
+                "meeting",
+                meeting.id,
+                {"approval_id": approval.id, "fields": sorted(normalized)},
+            )
+        else:
+            raise HTTPException(status_code=422, detail="Unsupported approval action")
     approval.status = "approved" if decision == "approve" else "rejected"
     approval.decided_at = now
-    if decision == "approve":
-        meeting.status = "cancelled"
-        meeting.updated_at = now
-        audit(db, approval.owner_id, "meeting.cancelled", "meeting", meeting.id, {"approval_id": approval.id})
     audit(db, approval.owner_id, f"approval.{approval.status}", "approval", approval.id)
     return attach_meeting(approval, meeting)

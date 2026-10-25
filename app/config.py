@@ -1,8 +1,9 @@
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +22,8 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("FRONTEND_ORIGIN", "FRONTEND_ORIGINS"),
     )
     approval_ttl_minutes: int = Field(default=15, ge=1, le=1440)
+    default_timezone: str = "Asia/Kolkata"
+    meeting_match_threshold: float = Field(default=0.78, ge=0.5, le=1.0)
     seed_name: str = "Lab User"
     seed_email: str = ""
     seed_password: str = ""
@@ -30,6 +33,15 @@ class Settings(BaseSettings):
     openai_timeout_seconds: float = 5.0
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    @field_validator("default_timezone")
+    @classmethod
+    def validate_default_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("DEFAULT_TIMEZONE must be a valid IANA timezone") from exc
+        return value
 
     def validate_lab_mode(self) -> None:
         if self.lab_mode == "vulnerable" and self.app_env.lower() != "development":

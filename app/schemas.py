@@ -103,6 +103,7 @@ class ApprovalResponse(BaseModel):
     meeting_status: str | None = None
     meeting_start_time: datetime | None = None
     action: str
+    payload: dict = Field(default_factory=dict)
     status: str
     expires_at: datetime
     decided_at: datetime | None
@@ -142,6 +143,15 @@ class CancellationResult(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+    conversation_id: str = Field(default="default", min_length=1, max_length=128)
+
+    @field_validator("conversation_id")
+    @classmethod
+    def normalize_conversation_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("conversation_id must not be blank")
+        return normalized
 
 
 class ChatResponse(BaseModel):

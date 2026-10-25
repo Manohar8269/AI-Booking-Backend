@@ -40,6 +40,7 @@ class Approval:
     owner_id: int = 0
     meeting_id: int = 0
     action: str = "cancel_meeting"
+    payload: dict = field(default_factory=dict)
     status: str = "pending"
     expires_at: datetime = field(default_factory=utc_now)
     decided_at: datetime | None = None
@@ -66,6 +67,7 @@ class ChatPendingAction:
     collection: ClassVar[str] = "chat_pending_actions"
     id: int | None = None
     owner_id: int = 0
+    conversation_id: str = "default"
     action: str = ""
     payload: dict = field(default_factory=dict)
     expires_at: datetime = field(default_factory=utc_now)

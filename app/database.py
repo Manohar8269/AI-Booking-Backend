@@ -47,7 +47,18 @@ def initialize_database() -> None:
     database.meetings.create_index([("owner_id", ASCENDING), ("start_time", ASCENDING), ("status", ASCENDING)])
     database.approvals.create_index([("owner_id", ASCENDING), ("created_at", DESCENDING)])
     database.audit_logs.create_index([("actor_id", ASCENDING), ("created_at", DESCENDING)])
-    database.chat_pending_actions.create_index([("owner_id", ASCENDING)], unique=True)
+    pending_indexes = database.chat_pending_actions.list_indexes()
+    for index in pending_indexes:
+        if index.get("unique") and list(index.get("key", {}).items()) == [("owner_id", ASCENDING)]:
+            database.chat_pending_actions.drop_index(index["name"])
+    database.chat_pending_actions.update_many(
+        {"conversation_id": {"$exists": False}},
+        {"$set": {"conversation_id": "default"}},
+    )
+    database.chat_pending_actions.create_index(
+        [("owner_id", ASCENDING), ("conversation_id", ASCENDING)],
+        unique=True,
+    )
     for collection_name in COLLECTIONS.values():
         collection = database[collection_name]
         highest = collection.find_one({}, {"_id": 1}, sort=[("_id", DESCENDING)])
